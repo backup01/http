@@ -89,6 +89,147 @@ char* getFileExtension(char *filename) {//выдать расширение фа
 	return strrchr(filename, '.');
 }
 
+void *handler(void *arg) {//для обработки запросов,в аргументе при создании handler'а мы передаём его номер в handler,в handler мы его считываем и пытаемся заблокировать соотв mutex(при создании handler основной поток блокирует его)когда сервер передаёт обработчику запрос на обработку,он разблокирует его. Тогда handler сможет заблокировать mutex и продолжить работу.сразу же после захвата mutex,он его разблокирует(показывая что hander работает)
+	int filesize = 0;
+	char *line = NULL;
+	size_t len = 0;
+
+	char buf[1024];
+
+	char *filepath = NULL;
+	size_t filepath_len = 0;
+	int empty_str_count = 0;
+
+	FILE *fd;
+	FILE *file;
+
+	// getting handler number
+	int *p = (int *) arg;
+	int k = *p;
+
+	// wait for lock
+	pthread_mutex_lock(&lock[k]);
+
+	pthread_mutex_unlock(&lock[k]);
+	
+	//try opening client descriptor
+	fd = fdopen(cd[k], "r");
+	if (fd == NULL) {//пытается открыть cd потом начинает читать заголовки запроса клиента,при этом получает имя файла,потом открывает этот файл для бинарного чтения,потом определяется расширение файла и ищется расширение в extensions(соответствие)Если найдено,то пишем заголовки клиенту и отправляем файл клиенту
+		printf("error open client descriptor as file \n");
+		printf("500 Internal Server Error \n");
+		headers(cd[k], 0, 500, NULL);
+	} else {
+		// reading client's headers
+		int res;
+		while ((res = getline(&line, &len, fd)) != -1) {
+			if (strstr(line, "GET")) {
+				parsingFileName(line, &filepath, &filepath_len);
+			}
+			if (strcmp(line, "\r\n") == 0) {
+				empty_str_count++;
+			}
+			else {
+				empty_str_count = 0;
+			}
+			if (empty_str_count == 1) {
+				break;
+			}
+			printf("%s", line);
+		}
+
+		printf("open %s \n", filepath);
+
+		file = fopen(filepath, "rb");
+
+		if (file == NULL) {
+			printf("404 File Not Found \n");
+			headers(cd[k], 0, 404, NULL);
+		}
+		else {
+			char *fileext = getFileExtension(filepath);
+			char *content_type = 0;
+			int i = 0;
+			while (extensions[i].ext != 0) {
+				if (strcmp(extensions[i].ext, fileext) == 0) {
+					int n = strlen(extensions[i].conttype);
+					content_type = (char*) malloc(n * sizeof(char));
+					strncpy(content_type, extensions[i].conttype, n);
+					break;
+				}
+				i++;
+			}
+			if (content_type != 0) {
+				fseek(file, 0L, SEEK_END);
+				filesize = ftell(file);
+				fseek(file, 0L, SEEK_SET);
+				headers(cd[k], filesize, 200, content_type); 
+
+				size_t nbytes = 0;
+
+				while ((nbytes = fread(buf, 1, 1024, file)) > 0) {
+					res = send(cd[k], buf, nbytes, 0);
+					if (res == -1) {
+						printf("send error \n");
+					}
+				}
+
+				free(content_type);
+			}	
+			else {
+				printf("500 Internal Server Error \n");
+				headers(cd[k], 0, 500, NULL);
+			}
+		}
+	}
+	close(cd[k]);
+	free(p);
+	
+	cd[k] = -1;//handler закончил работу
+
+	puts ("Handler destroyed");
+}
+
+
+void createThread(int k) {//создаёт k-ый поток
+	int *m = (int *)malloc(sizeof(int));
+	*m = k;
+	int err = pthread_create(&ntid[k], NULL, handler, (void *) m);
+	if (err != 0) {
+		printf("You can't to create a thread %s\n", strerror(err));
+	}
+}
+
+void *serv(void *arg) {//бесконечный цикл который восстанавливает умершие потоки и передаёт им cd(клиентские дескрипторы)
+	int i;
+
+	while (1) {	
+		struct qnode *item = TAILQ_FIRST(&qhead);
+		if (item != NULL) {
+			puts("Trying to find handler");
+			// try finding handler
+			i = 0;
+			while (i < N) {
+				if (pthread_mutex_trylock(&lock[i]) != 0) { 
+					// mutex is not acquired -> thread is free -> found
+					puts("Handler found");
+					cd[i] = item->value;
+					pthread_mutex_unlock(&lock[i]); // unlock mutex
+
+					// delete item from queue
+					TAILQ_REMOVE(&qhead, item, entries);
+					free(item);
+
+					break;
+				}
+				else {
+					pthread_mutex_unlock(&lock[i]);
+				}
+				i++;
+			}
+		}
+	}
+}
+
 
 int main() {//инициализируем очередь
 	int ld = 0;
